@@ -5,7 +5,8 @@ import sys
 from tkinter import Tk, filedialog, messagebox, ttk, StringVar, Menu
 import logging
 import numpy as np
-import json # For saving/loading settings
+import json
+import threading # Import threading
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,14 +15,12 @@ class AudioChunkerApp:
     def __init__(self, master):
         self.master = master
         master.title("Audio Chunk Tool for AI Voice Cloning (Enhanced)")
-        master.geometry("650x500") # Slightly larger window
-        master.resizable(False, False) # Prevent resizing
+        master.geometry("650x500")
+        master.resizable(False, False)
 
-        # --- Style ---
         style = ttk.Style(master)
-        style.theme_use('clam') # or 'alt', 'default', 'classic'
+        style.theme_use('clam')
 
-        # --- Variables ---
         self.file_path_var = StringVar()
         self.output_dir_var = StringVar()
         self.chunk_duration_var = StringVar(value="10")
@@ -30,7 +29,7 @@ class AudioChunkerApp:
         self.status_var = StringVar(value="Ready")
 
         self.config_file = "audio_chunker_config.json"
-        self._load_config() # Load saved settings
+        self._load_config()
 
         self._create_widgets()
         self._create_menu()
@@ -48,7 +47,8 @@ class AudioChunkerApp:
                     self.base_name_var.set(config.get('base_name', 'chunk'))
             except Exception as e:
                 logging.error(f"Error loading configuration: {e}")
-                messagebox.showerror("Config Error", f"Could not load settings: {e}")
+                # Use master.after to show messagebox after GUI is fully initialized
+                self.master.after(100, lambda: messagebox.showerror("Config Error", f"Could not load settings: {e}"))
 
     def _save_config(self):
         """Saves current settings to a JSON file."""
@@ -139,7 +139,8 @@ class AudioChunkerApp:
         self.open_output_button.config(state='disabled') # Disable until splitting is done
 
         # --- Status Bar ---
-        self.status_bar = ttk.Label(self.master, textvariable=self.status_var, relief=ttk.SUNKEN, anchor="w")
+        # Corrected: Use string "sunken" for relief
+        self.status_bar = ttk.Label(self.master, textvariable=self.status_var, relief="sunken", anchor="w")
         self.status_bar.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
 
         # Configure column to expand
@@ -207,7 +208,7 @@ class AudioChunkerApp:
         )
 
     def start_splitting(self):
-        """Initiates the audio splitting process."""
+        """Initiates the audio splitting process in a separate thread."""
         file_path = self.file_path_var.get()
         output_dir = self.output_dir_var.get()
         try:
@@ -238,20 +239,27 @@ class AudioChunkerApp:
                 return
 
         self._set_controls_state('disabled')
-        self.open_output_button.config(state='disabled') # Disable this until success
+        self.open_output_button.config(state='disabled') # Disable until success
         self._update_status("Loading audio file...")
 
-        try:
-            # Load the audio file, letting librosa determine the sample rate and force mono
-            y, sr = librosa.load(file_path, sr=None, mono=True)
+        # Start the splitting process in a new thread
+        splitting_thread = threading.Thread(target=self._perform_splitting_task, args=(
+            file_path, output_dir, chunk_duration_seconds, output_format, base_name
+        ))
+        splitting_thread.daemon = True # Allow the program to exit even if thread is running
+        splitting_thread.start()
 
+    def _perform_splitting_task(self, file_path, output_dir, chunk_duration_seconds, output_format, base_name):
+        """The actual splitting logic, run in a separate thread."""
+        try:
+            y, sr = librosa.load(file_path, sr=None, mono=True)
             duration = librosa.get_duration(y=y, sr=sr)
-            self._update_status(f"File loaded: {os.path.basename(file_path)} (SR: {sr}, Duration: {duration:.2f}s)")
+
+            self.master.after(0, lambda: self._update_status(f"File loaded: {os.path.basename(file_path)} (SR: {sr}, Duration: {duration:.2f}s)"))
             print(f"Loaded file: {file_path}")
             print(f"Sample Rate: {sr}")
             print(f"Duration: {duration:.2f} seconds")
 
-            # Create specific output subdirectory for chunks
             final_output_dir = os.path.join(output_dir, "audio_chunks")
             os.makedirs(final_output_dir, exist_ok=True)
 
@@ -260,41 +268,51 @@ class AudioChunkerApp:
             confirm_msg = (f"Audio will be split into approximately {total_chunks} chunks of {chunk_duration_seconds} seconds.\n"
                            f"Output will be saved in: {final_output_dir}\n"
                            f"Proceed?")
-            if not messagebox.askyesno("Confirmation", confirm_msg):
-                self._update_status("Operation Cancelled.")
-                messagebox.showinfo("Info", "Operation Cancelled.")
-                self._set_controls_state('normal')
+
+            # Ask confirmation on the main thread
+            proceed = messagebox.askyesno("Confirmation", confirm_msg)
+            if not proceed:
+                self.master.after(0, lambda: self._update_status("Operation Cancelled."))
+                self.master.after(0, lambda: messagebox.showinfo("Info", "Operation Cancelled."))
+                self.master.after(0, lambda: self._on_splitting_complete(False)) # Indicate cancellation
                 return
 
             original_file_name = os.path.splitext(os.path.basename(file_path))[0]
-            self._update_status("Splitting audio...")
+            self.master.after(0, lambda: self._update_status("Splitting audio..."))
 
             chunks_saved = self._split_audio_into_chunks(y, sr, chunk_duration_seconds, final_output_dir,
                                                         base_name, output_format, original_file_name=original_file_name)
 
-            self._update_status(f"Successfully split into {chunks_saved} chunks!")
-            messagebox.showinfo("Success", f"Audio split into {chunks_saved} chunks in:\n{final_output_dir}")
-            self.open_output_button.config(state='normal') # Enable after success
+            self.master.after(0, lambda: self._update_status(f"Successfully split into {chunks_saved} chunks!"))
+            self.master.after(0, lambda: messagebox.showinfo("Success", f"Audio split into {chunks_saved} chunks in:\n{final_output_dir}"))
             self._save_config() # Save current settings
+            self.master.after(0, lambda: self._on_splitting_complete(True)) # Indicate success
         except librosa.LibrosaError as e:
             error_msg = f"Error loading audio file: {e}"
-            messagebox.showerror("Audio Load Error", error_msg)
+            self.master.after(0, lambda: messagebox.showerror("Audio Load Error", error_msg))
             logging.error(error_msg)
-            self._update_status("Error loading audio file.")
+            self.master.after(0, lambda: self._update_status("Error loading audio file."))
+            self.master.after(0, lambda: self._on_splitting_complete(False)) # Indicate failure
         except sf.SoundFileError as e:
             error_msg = f"Error writing audio chunk: {e}"
-            messagebox.showerror("File Write Error", error_msg)
+            self.master.after(0, lambda: messagebox.showerror("File Write Error", error_msg))
             logging.error(error_msg)
-            self._update_status("Error writing audio chunks.")
+            self.master.after(0, lambda: self._update_status("Error writing audio chunks."))
+            self.master.after(0, lambda: self._on_splitting_complete(False)) # Indicate failure
         except Exception as e:
             error_msg = f"An unexpected error occurred: {str(e)}"
-            messagebox.showerror("General Error", error_msg)
-            logging.error(error_msg, exc_info=True) # Log full traceback
-            self._update_status("An unexpected error occurred.")
-        finally:
-            self._set_controls_state('normal')
-            # If start button was already enabled, ensure it remains so.
-            # If it was disabled due to an error, it should now be re-enabled.
+            self.master.after(0, lambda: messagebox.showerror("General Error", error_msg))
+            logging.error(error_msg, exc_info=True)
+            self.master.after(0, lambda: self._update_status("An unexpected error occurred."))
+            self.master.after(0, lambda: self._on_splitting_complete(False)) # Indicate failure
+
+    def _on_splitting_complete(self, success):
+        """Called on the main thread after splitting task is complete."""
+        self._set_controls_state('normal')
+        if success:
+            self.open_output_button.config(state='normal')
+        else:
+            self.open_output_button.config(state='disabled')
 
 
     def _split_audio_into_chunks(self, audio_data, sample_rate, chunk_duration_seconds, output_dir, base_name, output_format, mono=True, original_file_name=None):
@@ -303,7 +321,7 @@ class AudioChunkerApp:
         total_chunks = int(duration // chunk_duration_seconds) + (1 if duration % chunk_duration_seconds != 0 else 0)
 
         print(f"Generating {total_chunks} chunks...")
-        self._update_status(f"Processing 0/{total_chunks} chunks...")
+        self.master.after(0, lambda: self._update_status(f"Processing 0/{total_chunks} chunks..."))
 
         chunks_saved_count = 0
         for i in range(total_chunks):
@@ -311,31 +329,32 @@ class AudioChunkerApp:
             end_sample = min((i + 1) * chunk_duration_seconds * sample_rate, len(audio_data))
             chunk = audio_data[int(start_sample):int(end_sample)]
 
-            # Ensure chunk is float32 for soundfile compatibility
             chunk = chunk.astype(np.float32)
 
-            # Create custom filename
             file_prefix = original_file_name if original_file_name else base_name
-            # Sanitize file_prefix to remove invalid characters
             file_prefix = "".join(c for c in file_prefix if c.isalnum() or c in (' ', '_', '-')).strip()
-            if not file_prefix: # Fallback if sanitized name is empty
+            if not file_prefix:
                 file_prefix = "chunk"
 
-            output_file_path = os.path.join(output_dir, f"{file_prefix}_{str(i + 1).zfill(len(str(total_chunks)))}.{output_format}")
+            # Determine padding length for chunk number based on total_chunks
+            padding_length = len(str(total_chunks))
+            output_file_path = os.path.join(output_dir, f"{file_prefix}_{str(i + 1).zfill(padding_length)}.{output_format}")
 
             try:
                 sf.write(output_file_path, chunk, sample_rate, format=output_format)
                 print(f"Saved: {output_file_path}")
                 chunks_saved_count += 1
-                self._update_status(f"Processing {i+1}/{total_chunks} chunks...")
+                self.master.after(0, lambda idx=i+1: self._update_status(f"Processing {idx}/{total_chunks} chunks..."))
             except sf.SoundFileError as e:
                 logging.error(f"Error writing to {output_file_path}: {e}")
                 print(f"Error writing to {output_file_path}: {e}")
-                self._update_status(f"Error saving chunk {i+1}. See logs.")
+                self.master.after(0, lambda idx=i+1: self._update_status(f"Error saving chunk {idx}. See logs."))
+                # Continue processing other chunks even if one fails to write
             except Exception as e:
                 logging.error(f"An unexpected error occurred while writing {output_file_path}: {e}")
                 print(f"An unexpected error occurred while writing {output_file_path}: {e}")
-                self._update_status(f"Error saving chunk {i+1}. See logs.")
+                self.master.after(0, lambda idx=i+1: self._update_status(f"Error saving chunk {idx}. See logs."))
+                # Continue processing other chunks even if one fails
 
         return chunks_saved_count
 
